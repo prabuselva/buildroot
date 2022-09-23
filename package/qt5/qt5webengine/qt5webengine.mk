@@ -9,7 +9,7 @@ QT5WEBENGINE_SITE = $(QT5_SITE)
 QT5WEBENGINE_SOURCE = qtwebengine-$(QT5_SOURCE_TARBALL_PREFIX)-$(QT5WEBENGINE_VERSION).tar.xz
 QT5WEBENGINE_DEPENDENCIES = ffmpeg libglib2 libvpx libxkbcommon opus webp \
 	qt5declarative qt5webchannel host-bison host-flex host-gperf \
-	host-pkgconf host-python
+	host-pkgconf host-python host-harfbuzz
 QT5WEBENGINE_INSTALL_STAGING = YES
 
 include package/qt5/qt5webengine/chromium-latest.inc
@@ -59,6 +59,14 @@ define QT5WEBENGINE_CREATE_HOST_PKG_CONFIG
 endef
 QT5WEBENGINE_PRE_CONFIGURE_HOOKS += QT5WEBENGINE_CREATE_HOST_PKG_CONFIG
 QT5WEBENGINE_ENV += GN_PKG_CONFIG_HOST=$(@D)/host-bin/host-pkg-config
+
+ifeq ($(BR2_PACKAGE_QT5BASE_FONTCONFIG),y)
+QT5WEBENGINE_DEPENDENCIES += host-freetype
+endif
+
+ifeq ($(BR2_PACKAGE_QT5BASE_JPEG),y)
+QT5WEBENGINE_DEPENDENCIES += host-libjpeg
+endif
 
 QT5WEBENGINE_CONF_ENV = $(QT5WEBENGINE_ENV)
 QT5WEBENGINE_MAKE_ENV = $(QT5WEBENGINE_ENV)
