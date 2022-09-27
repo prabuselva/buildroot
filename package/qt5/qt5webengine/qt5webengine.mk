@@ -9,7 +9,7 @@ QT5WEBENGINE_SITE = $(QT5_SITE)
 QT5WEBENGINE_SOURCE = qtwebengine-$(QT5_SOURCE_TARBALL_PREFIX)-$(QT5WEBENGINE_VERSION).tar.xz
 QT5WEBENGINE_DEPENDENCIES = ffmpeg libglib2 libvpx libxkbcommon opus webp \
 	qt5declarative qt5webchannel host-bison host-flex host-gperf \
-	host-pkgconf host-python host-harfbuzz xlib_libXdamage
+	host-pkgconf host-python host-harfbuzz xlib_libXdamage host-webp
 QT5WEBENGINE_INSTALL_STAGING = YES
 
 include package/qt5/qt5webengine/chromium-latest.inc
@@ -29,16 +29,21 @@ endif
 
 QT5WEBENGINE_DEPENDENCIES += host-libpng host-libnss libnss
 
-QT5WEBENGINE_CONF_OPTS += WEBENGINE_CONFIG+=use_system_ffmpeg
+QT5WEBENGINE_CONF_OPTS = QMAKE_CFLAGS+=-mthumb --
+
+#QT5WEBENGINE_CONF_OPTS += WEBENGINE_CONFIG+=user_system_ffmpeg  QMAKE_CFLAGS+=-mthumb
+
+QT5WEBENGINE_CONF_OPTS += -webengine-ffmpeg
 
 ifeq ($(BR2_PACKAGE_QT5WEBENGINE_PROPRIETARY_CODECS),y)
-QT5WEBENGINE_CONF_OPTS += WEBENGINE_CONFIG+=use_proprietary_codecs
+#QT5WEBENGINE_CONF_OPTS += WEBENGINE_CONFIG+=use_proprietary_codecs
+QT5WEBENGINE_CONF_OPTS += -webengine-proprietary-codecs
 endif
 
 ifeq ($(BR2_PACKAGE_QT5WEBENGINE_ALSA),y)
 QT5WEBENGINE_DEPENDENCIES += alsa-lib
 else
-QT5WEBENGINE_CONF_OPTS += QT_CONFIG-=alsa
+QT5WEBENGINE_CONF_OPTS += -no-webengine-alsa
 endif
 
 # QtWebengine's build system uses python, but only supports python2. We work
