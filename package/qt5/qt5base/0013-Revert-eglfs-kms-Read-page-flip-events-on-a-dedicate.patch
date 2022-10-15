@@ -1,0 +1,652 @@
+From 229a36fdf0c1f1538d4c1e3dbdd5b377855ab89b Mon Sep 17 00:00:00 2001
+From: Claus Stovgaard <clst@ambu.com>
+Date: Tue, 13 Sep 2022 09:24:59 +0200
+Subject: [PATCH] Revert "eglfs: kms: Read page flip events on a dedicated
+ thread"
+
+This reverts commit 14bb413309092adc53e8451daff5690c4698c07d.
+---
+ .../eglfs_kms/qeglfskmsgbmdevice.cpp          |   4 -
+ .../eglfs_kms/qeglfskmsgbmintegration.cpp     |   2 +
+ .../eglfs_kms/qeglfskmsgbmscreen.cpp          |  28 ++-
+ .../eglfs_kms/qeglfskmsgbmscreen.h            |  16 +-
+ .../qeglfskmsegldevicescreen.cpp              |   2 +-
+ .../qeglfskmsegldevicescreen.h                |   2 +-
+ .../eglfs_kms_support/eglfs_kms_support.pro   |   6 +-
+ .../eglfs_kms_support/qeglfskmsdevice.h       |   6 -
+ .../qeglfskmseventreader.cpp                  | 218 ------------------
+ .../eglfs_kms_support/qeglfskmseventreader.h  |  99 --------
+ .../eglfs_kms_support/qeglfskmsscreen.cpp     |   3 +-
+ .../eglfs_kms_support/qeglfskmsscreen.h       |   7 +-
+ .../eglfs_kms_vsp2/qeglfskmsvsp2screen.cpp    |   2 +-
+ .../eglfs_kms_vsp2/qeglfskmsvsp2screen.h      |   2 +-
+ 14 files changed, 43 insertions(+), 354 deletions(-)
+ delete mode 100644 src/plugins/platforms/eglfs/deviceintegration/eglfs_kms_support/qeglfskmseventreader.cpp
+ delete mode 100644 src/plugins/platforms/eglfs/deviceintegration/eglfs_kms_support/qeglfskmseventreader.h
+
+diff --git a/src/plugins/platforms/eglfs/deviceintegration/eglfs_kms/qeglfskmsgbmdevice.cpp b/src/plugins/platforms/eglfs/deviceintegration/eglfs_kms/qeglfskmsgbmdevice.cpp
+index 503419cf91..f4a69483bd 100644
+--- a/src/plugins/platforms/eglfs/deviceintegration/eglfs_kms/qeglfskmsgbmdevice.cpp
++++ b/src/plugins/platforms/eglfs/deviceintegration/eglfs_kms/qeglfskmsgbmdevice.cpp
+@@ -83,8 +83,6 @@ bool QEglFSKmsGbmDevice::open()
+ 
+     setFd(fd);
+ 
+-    m_eventReader.create(this);
+-
+     return true;
+ }
+ 
+@@ -92,8 +90,6 @@ void QEglFSKmsGbmDevice::close()
+ {
+     // Note: screens are gone at this stage.
+ 
+-    m_eventReader.destroy();
+-
+     if (m_gbm_device) {
+         gbm_device_destroy(m_gbm_device);
+         m_gbm_device = nullptr;
+diff --git a/src/plugins/platforms/eglfs/deviceintegration/eglfs_kms/qeglfskmsgbmintegration.cpp b/src/plugins/platforms/eglfs/deviceintegration/eglfs_kms/qeglfskmsgbmintegration.cpp
+index caa1187b40..f154520669 100644
+--- a/src/plugins/platforms/eglfs/deviceintegration/eglfs_kms/qeglfskmsgbmintegration.cpp
++++ b/src/plugins/platforms/eglfs/deviceintegration/eglfs_kms/qeglfskmsgbmintegration.cpp
+@@ -54,6 +54,8 @@
+ 
+ QT_BEGIN_NAMESPACE
+ 
++QMutex QEglFSKmsGbmScreen::m_waitForFlipMutex;
++
+ QEglFSKmsGbmIntegration::QEglFSKmsGbmIntegration()
+ {
+     qCDebug(qLcEglfsKmsDebug, "New DRM/KMS via GBM integration created");
+diff --git a/src/plugins/platforms/eglfs/deviceintegration/eglfs_kms/qeglfskmsgbmscreen.cpp b/src/plugins/platforms/eglfs/deviceintegration/eglfs_kms/qeglfskmsgbmscreen.cpp
+index 95b51c9601..fdb6fbd20c 100644
+--- a/src/plugins/platforms/eglfs/deviceintegration/eglfs_kms/qeglfskmsgbmscreen.cpp
++++ b/src/plugins/platforms/eglfs/deviceintegration/eglfs_kms/qeglfskmsgbmscreen.cpp
+@@ -110,7 +110,7 @@ QEglFSKmsGbmScreen::FrameBuffer *QEglFSKmsGbmScreen::framebufferForBufferObject(
+     return fb.take();
+ }
+ 
+-QEglFSKmsGbmScreen::QEglFSKmsGbmScreen(QEglFSKmsDevice *device, const QKmsOutput &output, bool headless)
++QEglFSKmsGbmScreen::QEglFSKmsGbmScreen(QKmsDevice *device, const QKmsOutput &output, bool headless)
+     : QEglFSKmsScreen(device, output, headless)
+     , m_gbm_surface(nullptr)
+     , m_gbm_bo_current(nullptr)
+@@ -271,12 +271,15 @@ void QEglFSKmsGbmScreen::waitForFlip()
+     if (!m_gbm_bo_next)
+         return;
+ 
+-    m_flipMutex.lock();
+-    device()->eventReader()->startWaitFlip(this, &m_flipMutex, &m_flipCond);
+-    m_flipCond.wait(&m_flipMutex);
+-    m_flipMutex.unlock();
+-
+-    flipFinished();
++    QMutexLocker lock(&m_waitForFlipMutex);
++    while (m_gbm_bo_next) {
++        drmEventContext drmEvent;
++        memset(&drmEvent, 0, sizeof(drmEvent));
++        drmEvent.version = 2;
++        drmEvent.vblank_handler = nullptr;
++        drmEvent.page_flip_handler = pageFlipHandler;
++        drmHandleEvent(device()->fd(), &drmEvent);
++    }
+ 
+ #if QT_CONFIG(drm_atomic)
+     device()->threadLocalAtomicReset();
+@@ -389,6 +392,17 @@ void QEglFSKmsGbmScreen::flip()
+ #endif
+ }
+ 
++void QEglFSKmsGbmScreen::pageFlipHandler(int fd, unsigned int sequence, unsigned int tv_sec, unsigned int tv_usec, void *user_data)
++{
++    Q_UNUSED(fd);
++    Q_UNUSED(sequence);
++    Q_UNUSED(tv_sec);
++    Q_UNUSED(tv_usec);
++
++    QEglFSKmsGbmScreen *screen = static_cast<QEglFSKmsGbmScreen *>(user_data);
++    screen->flipFinished();
++}
++
+ void QEglFSKmsGbmScreen::flipFinished()
+ {
+     if (m_cloneSource) {
+diff --git a/src/plugins/platforms/eglfs/deviceintegration/eglfs_kms/qeglfskmsgbmscreen.h b/src/plugins/platforms/eglfs/deviceintegration/eglfs_kms/qeglfskmsgbmscreen.h
+index 69feeee703..b94f44b7b1 100644
+--- a/src/plugins/platforms/eglfs/deviceintegration/eglfs_kms/qeglfskmsgbmscreen.h
++++ b/src/plugins/platforms/eglfs/deviceintegration/eglfs_kms/qeglfskmsgbmscreen.h
+@@ -43,8 +43,7 @@
+ #define QEGLFSKMSGBMSCREEN_H
+ 
+ #include "qeglfskmsscreen.h"
+-#include <QMutex>
+-#include <QWaitCondition>
++#include <QtCore/QMutex>
+ 
+ #include <gbm.h>
+ 
+@@ -55,7 +54,7 @@ class QEglFSKmsGbmCursor;
+ class QEglFSKmsGbmScreen : public QEglFSKmsScreen
+ {
+ public:
+-    QEglFSKmsGbmScreen(QEglFSKmsDevice *device, const QKmsOutput &output, bool headless);
++    QEglFSKmsGbmScreen(QKmsDevice *device, const QKmsOutput &output, bool headless);
+     ~QEglFSKmsGbmScreen();
+ 
+     QPlatformCursor *cursor() const override;
+@@ -76,15 +75,18 @@ private:
+     void cloneDestFlipFinished(QEglFSKmsGbmScreen *cloneDestScreen);
+     void updateFlipStatus();
+ 
++    static void pageFlipHandler(int fd,
++                                unsigned int sequence,
++                                unsigned int tv_sec,
++                                unsigned int tv_usec,
++                                void *user_data);
++
+     gbm_surface *m_gbm_surface;
+ 
+     gbm_bo *m_gbm_bo_current;
+     gbm_bo *m_gbm_bo_next;
+     bool m_flipPending;
+ 
+-    QMutex m_flipMutex;
+-    QWaitCondition m_flipCond;
+-
+     QScopedPointer<QEglFSKmsGbmCursor> m_cursor;
+ 
+     struct FrameBuffer {
+@@ -99,6 +101,8 @@ private:
+         bool cloneFlipPending = false;
+     };
+     QVector<CloneDestination> m_cloneDests;
++
++    static QMutex m_waitForFlipMutex;
+ };
+ 
+ QT_END_NAMESPACE
+diff --git a/src/plugins/platforms/eglfs/deviceintegration/eglfs_kms_egldevice/qeglfskmsegldevicescreen.cpp b/src/plugins/platforms/eglfs/deviceintegration/eglfs_kms_egldevice/qeglfskmsegldevicescreen.cpp
+index 5a62e437c4..1626c86239 100644
+--- a/src/plugins/platforms/eglfs/deviceintegration/eglfs_kms_egldevice/qeglfskmsegldevicescreen.cpp
++++ b/src/plugins/platforms/eglfs/deviceintegration/eglfs_kms_egldevice/qeglfskmsegldevicescreen.cpp
+@@ -47,7 +47,7 @@ QT_BEGIN_NAMESPACE
+ 
+ Q_DECLARE_LOGGING_CATEGORY(qLcEglfsKmsDebug)
+ 
+-QEglFSKmsEglDeviceScreen::QEglFSKmsEglDeviceScreen(QEglFSKmsDevice *device, const QKmsOutput &output)
++QEglFSKmsEglDeviceScreen::QEglFSKmsEglDeviceScreen(QKmsDevice *device, const QKmsOutput &output)
+     : QEglFSKmsScreen(device, output)
+ {
+ }
+diff --git a/src/plugins/platforms/eglfs/deviceintegration/eglfs_kms_egldevice/qeglfskmsegldevicescreen.h b/src/plugins/platforms/eglfs/deviceintegration/eglfs_kms_egldevice/qeglfskmsegldevicescreen.h
+index 961398ba3e..5efe35f8b3 100644
+--- a/src/plugins/platforms/eglfs/deviceintegration/eglfs_kms_egldevice/qeglfskmsegldevicescreen.h
++++ b/src/plugins/platforms/eglfs/deviceintegration/eglfs_kms_egldevice/qeglfskmsegldevicescreen.h
+@@ -47,7 +47,7 @@ QT_BEGIN_NAMESPACE
+ class QEglFSKmsEglDeviceScreen : public QEglFSKmsScreen
+ {
+ public:
+-    QEglFSKmsEglDeviceScreen(QEglFSKmsDevice *device, const QKmsOutput &output);
++    QEglFSKmsEglDeviceScreen(QKmsDevice *device, const QKmsOutput &output);
+     ~QEglFSKmsEglDeviceScreen();
+ 
+     QPlatformCursor *cursor() const override;
+diff --git a/src/plugins/platforms/eglfs/deviceintegration/eglfs_kms_support/eglfs_kms_support.pro b/src/plugins/platforms/eglfs/deviceintegration/eglfs_kms_support/eglfs_kms_support.pro
+index e51903ed96..40806b6a9b 100644
+--- a/src/plugins/platforms/eglfs/deviceintegration/eglfs_kms_support/eglfs_kms_support.pro
++++ b/src/plugins/platforms/eglfs/deviceintegration/eglfs_kms_support/eglfs_kms_support.pro
+@@ -14,11 +14,9 @@ CONFIG += egl
+ 
+ SOURCES += $$PWD/qeglfskmsintegration.cpp \
+            $$PWD/qeglfskmsdevice.cpp \
+-           $$PWD/qeglfskmsscreen.cpp \
+-           $$PWD/qeglfskmseventreader.cpp
++           $$PWD/qeglfskmsscreen.cpp
+ 
+ HEADERS += $$PWD/qeglfskmsintegration.h \
+            $$PWD/qeglfskmsdevice.h \
+            $$PWD/qeglfskmsscreen.h \
+-           $$PWD/qeglfskmshelpers.h \
+-           $$PWD/qeglfskmseventreader.h
++           $$PWD/qeglfskmshelpers.h
+diff --git a/src/plugins/platforms/eglfs/deviceintegration/eglfs_kms_support/qeglfskmsdevice.h b/src/plugins/platforms/eglfs/deviceintegration/eglfs_kms_support/qeglfskmsdevice.h
+index 34908aa60f..fc83a620d9 100644
+--- a/src/plugins/platforms/eglfs/deviceintegration/eglfs_kms_support/qeglfskmsdevice.h
++++ b/src/plugins/platforms/eglfs/deviceintegration/eglfs_kms_support/qeglfskmsdevice.h
+@@ -42,7 +42,6 @@
+ #define QEGLFSKMSDEVICE_H
+ 
+ #include "private/qeglfsglobal_p.h"
+-#include "qeglfskmseventreader.h"
+ #include <QtKmsSupport/private/qkmsdevice_p.h>
+ 
+ QT_BEGIN_NAMESPACE
+@@ -56,11 +55,6 @@ public:
+                         bool isPrimary,
+                         const QPoint &virtualPos,
+                         const QList<QPlatformScreen *> &virtualSiblings) override;
+-
+-    QEglFSKmsEventReader *eventReader() { return &m_eventReader; }
+-
+-protected:
+-    QEglFSKmsEventReader m_eventReader;
+ };
+ 
+ QT_END_NAMESPACE
+diff --git a/src/plugins/platforms/eglfs/deviceintegration/eglfs_kms_support/qeglfskmseventreader.cpp b/src/plugins/platforms/eglfs/deviceintegration/eglfs_kms_support/qeglfskmseventreader.cpp
+deleted file mode 100644
+index 645a0ae2e9..0000000000
+--- a/src/plugins/platforms/eglfs/deviceintegration/eglfs_kms_support/qeglfskmseventreader.cpp
++++ /dev/null
+@@ -1,218 +0,0 @@
+-/****************************************************************************
+-**
+-** Copyright (C) 2019 The Qt Company Ltd.
+-** Contact: https://www.qt.io/licensing/
+-**
+-** This file is part of the plugins of the Qt Toolkit.
+-**
+-** $QT_BEGIN_LICENSE:LGPL$
+-** Commercial License Usage
+-** Licensees holding valid commercial Qt licenses may use this file in
+-** accordance with the commercial license agreement provided with the
+-** Software or, alternatively, in accordance with the terms contained in
+-** a written agreement between you and The Qt Company. For licensing terms
+-** and conditions see https://www.qt.io/terms-conditions. For further
+-** information use the contact form at https://www.qt.io/contact-us.
+-**
+-** GNU Lesser General Public License Usage
+-** Alternatively, this file may be used under the terms of the GNU Lesser
+-** General Public License version 3 as published by the Free Software
+-** Foundation and appearing in the file LICENSE.LGPL3 included in the
+-** packaging of this file. Please review the following information to
+-** ensure the GNU Lesser General Public License version 3 requirements
+-** will be met: https://www.gnu.org/licenses/lgpl-3.0.html.
+-**
+-** GNU General Public License Usage
+-** Alternatively, this file may be used under the terms of the GNU
+-** General Public License version 2.0 or (at your option) the GNU General
+-** Public license version 3 or any later version approved by the KDE Free
+-** Qt Foundation. The licenses are as published by the Free Software
+-** Foundation and appearing in the file LICENSE.GPL2 and LICENSE.GPL3
+-** included in the packaging of this file. Please review the following
+-** information to ensure the GNU General Public License requirements will
+-** be met: https://www.gnu.org/licenses/gpl-2.0.html and
+-** https://www.gnu.org/licenses/gpl-3.0.html.
+-**
+-** $QT_END_LICENSE$
+-**
+-****************************************************************************/
+-
+-#include "qeglfskmseventreader.h"
+-#include "qeglfskmsdevice.h"
+-#include <QSocketNotifier>
+-#include <QCoreApplication>
+-#include <QLoggingCategory>
+-
+-QT_BEGIN_NAMESPACE
+-
+-Q_DECLARE_LOGGING_CATEGORY(qLcEglfsKmsDebug)
+-
+-static void pageFlipHandler(int fd, unsigned int sequence, unsigned int tv_sec, unsigned int tv_usec, void *user_data)
+-{
+-    Q_UNUSED(fd);
+-    Q_UNUSED(sequence);
+-    Q_UNUSED(tv_sec);
+-    Q_UNUSED(tv_usec);
+-
+-    QEglFSKmsEventReaderThread *t = static_cast<QEglFSKmsEventReaderThread *>(QThread::currentThread());
+-    t->eventHost()->handlePageFlipCompleted(user_data);
+-}
+-
+-class RegisterWaitFlipEvent : public QEvent
+-{
+-public:
+-    static const QEvent::Type TYPE = QEvent::Type(QEvent::User + 1);
+-    RegisterWaitFlipEvent(void *key, QMutex *mutex, QWaitCondition *cond)
+-        : QEvent(TYPE), key(key), mutex(mutex), cond(cond)
+-    { }
+-    void *key;
+-    QMutex *mutex;
+-    QWaitCondition *cond;
+-};
+-
+-bool QEglFSKmsEventHost::event(QEvent *event)
+-{
+-    if (event->type() == RegisterWaitFlipEvent::TYPE) {
+-        RegisterWaitFlipEvent *e = static_cast<RegisterWaitFlipEvent *>(event);
+-        PendingFlipWait *p = &pendingFlipWaits[0];
+-        PendingFlipWait *end = p + MAX_FLIPS;
+-        while (p < end) {
+-            if (!p->key) {
+-                p->key = e->key;
+-                p->mutex = e->mutex;
+-                p->cond = e->cond;
+-                updateStatus();
+-                return true;
+-            }
+-            ++p;
+-        }
+-        qWarning("Cannot queue page flip wait (more than %d screens?)", MAX_FLIPS);
+-        e->mutex->lock();
+-        e->cond->wakeOne();
+-        e->mutex->unlock();
+-        return true;
+-    }
+-    return QObject::event(event);
+-}
+-
+-void QEglFSKmsEventHost::updateStatus()
+-{
+-    void **begin = &completedFlips[0];
+-    void **end = begin + MAX_FLIPS;
+-
+-    for (int i = 0; i < MAX_FLIPS; ++i) {
+-        PendingFlipWait *w = pendingFlipWaits + i;
+-        if (!w->key)
+-            continue;
+-
+-        void **p = begin;
+-        while (p < end) {
+-            if (*p == w->key) {
+-                *p = nullptr;
+-                w->key = nullptr;
+-                w->mutex->lock();
+-                w->cond->wakeOne();
+-                w->mutex->unlock();
+-                return;
+-            }
+-            ++p;
+-        }
+-    }
+-}
+-
+-void QEglFSKmsEventHost::handlePageFlipCompleted(void *key)
+-{
+-    void **begin = &completedFlips[0];
+-    void **end = begin + MAX_FLIPS;
+-    void **p = begin;
+-    while (p < end) {
+-        if (*p == key) {
+-            updateStatus();
+-            return;
+-        }
+-        ++p;
+-    }
+-    p = begin;
+-    while (p < end) {
+-        if (!*p) {
+-            *p = key;
+-            updateStatus();
+-            return;
+-        }
+-        ++p;
+-    }
+-    qWarning("Cannot store page flip status (more than %d screens?)", MAX_FLIPS);
+-}
+-
+-void QEglFSKmsEventReaderThread::run()
+-{
+-    qCDebug(qLcEglfsKmsDebug, "Event reader thread: entering event loop");
+-
+-    QSocketNotifier notifier(m_fd, QSocketNotifier::Read);
+-    QObject::connect(&notifier, &QSocketNotifier::activated, &notifier, [this] {
+-        drmEventContext drmEvent;
+-        memset(&drmEvent, 0, sizeof(drmEvent));
+-        drmEvent.version = 2;
+-        drmEvent.vblank_handler = nullptr;
+-        drmEvent.page_flip_handler = pageFlipHandler;
+-        drmHandleEvent(m_fd, &drmEvent);
+-    });
+-
+-    exec();
+-
+-    m_ev.moveToThread(thread()); // move back to the thread where m_ev was created
+-
+-    qCDebug(qLcEglfsKmsDebug, "Event reader thread: event loop stopped");
+-}
+-
+-QEglFSKmsEventReader::~QEglFSKmsEventReader()
+-{
+-    destroy();
+-}
+-
+-void QEglFSKmsEventReader::create(QEglFSKmsDevice *device)
+-{
+-    destroy();
+-
+-    if (!device)
+-        return;
+-
+-    m_device = device;
+-
+-    qCDebug(qLcEglfsKmsDebug, "Initalizing event reader for device %p fd %d",
+-            m_device, m_device->fd());
+-
+-    m_thread = new QEglFSKmsEventReaderThread(m_device->fd());
+-    m_thread->start();
+-
+-    // Change thread affinity for the event host, so that postEvent()
+-    // goes through the event reader thread's event loop for that object.
+-    m_thread->eventHost()->moveToThread(m_thread);
+-}
+-
+-void QEglFSKmsEventReader::destroy()
+-{
+-    if (!m_device)
+-        return;
+-
+-    qCDebug(qLcEglfsKmsDebug, "Stopping event reader for device %p", m_device);
+-
+-    if (m_thread) {
+-        m_thread->quit();
+-        m_thread->wait();
+-        delete m_thread;
+-        m_thread = nullptr;
+-    }
+-
+-    m_device = nullptr;
+-}
+-
+-void QEglFSKmsEventReader::startWaitFlip(void *key, QMutex *mutex, QWaitCondition *cond)
+-{
+-    if (m_thread) {
+-        QCoreApplication::postEvent(m_thread->eventHost(),
+-                                    new RegisterWaitFlipEvent(key, mutex, cond));
+-    }
+-}
+-
+-QT_END_NAMESPACE
+diff --git a/src/plugins/platforms/eglfs/deviceintegration/eglfs_kms_support/qeglfskmseventreader.h b/src/plugins/platforms/eglfs/deviceintegration/eglfs_kms_support/qeglfskmseventreader.h
+deleted file mode 100644
+index 4aa285b0fe..0000000000
+--- a/src/plugins/platforms/eglfs/deviceintegration/eglfs_kms_support/qeglfskmseventreader.h
++++ /dev/null
+@@ -1,99 +0,0 @@
+-/****************************************************************************
+-**
+-** Copyright (C) 2019 The Qt Company Ltd.
+-** Contact: https://www.qt.io/licensing/
+-**
+-** This file is part of the plugins of the Qt Toolkit.
+-**
+-** $QT_BEGIN_LICENSE:LGPL$
+-** Commercial License Usage
+-** Licensees holding valid commercial Qt licenses may use this file in
+-** accordance with the commercial license agreement provided with the
+-** Software or, alternatively, in accordance with the terms contained in
+-** a written agreement between you and The Qt Company. For licensing terms
+-** and conditions see https://www.qt.io/terms-conditions. For further
+-** information use the contact form at https://www.qt.io/contact-us.
+-**
+-** GNU Lesser General Public License Usage
+-** Alternatively, this file may be used under the terms of the GNU Lesser
+-** General Public License version 3 as published by the Free Software
+-** Foundation and appearing in the file LICENSE.LGPL3 included in the
+-** packaging of this file. Please review the following information to
+-** ensure the GNU Lesser General Public License version 3 requirements
+-** will be met: https://www.gnu.org/licenses/lgpl-3.0.html.
+-**
+-** GNU General Public License Usage
+-** Alternatively, this file may be used under the terms of the GNU
+-** General Public License version 2.0 or (at your option) the GNU General
+-** Public license version 3 or any later version approved by the KDE Free
+-** Qt Foundation. The licenses are as published by the Free Software
+-** Foundation and appearing in the file LICENSE.GPL2 and LICENSE.GPL3
+-** included in the packaging of this file. Please review the following
+-** information to ensure the GNU General Public License requirements will
+-** be met: https://www.gnu.org/licenses/gpl-2.0.html and
+-** https://www.gnu.org/licenses/gpl-3.0.html.
+-**
+-** $QT_END_LICENSE$
+-**
+-****************************************************************************/
+-
+-#ifndef QEGLFSKKMSEVENTREADER_H
+-#define QEGLFSKKMSEVENTREADER_H
+-
+-#include "private/qeglfsglobal_p.h"
+-#include <QObject>
+-#include <QThread>
+-#include <QMutex>
+-#include <QWaitCondition>
+-
+-QT_BEGIN_NAMESPACE
+-
+-class QEglFSKmsDevice;
+-
+-struct QEglFSKmsEventHost : public QObject
+-{
+-    struct PendingFlipWait {
+-        void *key;
+-        QMutex *mutex;
+-        QWaitCondition *cond;
+-    };
+-
+-    static const int MAX_FLIPS = 32;
+-    void *completedFlips[MAX_FLIPS] = {};
+-    QEglFSKmsEventHost::PendingFlipWait pendingFlipWaits[MAX_FLIPS] = {};
+-
+-    bool event(QEvent *event) override;
+-    void updateStatus();
+-    void handlePageFlipCompleted(void *key);
+-};
+-
+-class QEglFSKmsEventReaderThread : public QThread
+-{
+-public:
+-    QEglFSKmsEventReaderThread(int fd) : m_fd(fd) { }
+-    void run() override;
+-    QEglFSKmsEventHost *eventHost() { return &m_ev; }
+-
+-private:
+-    int m_fd;
+-    QEglFSKmsEventHost m_ev;
+-};
+-
+-class Q_EGLFS_EXPORT QEglFSKmsEventReader
+-{
+-public:
+-    ~QEglFSKmsEventReader();
+-
+-    void create(QEglFSKmsDevice *device);
+-    void destroy();
+-
+-    void startWaitFlip(void *key, QMutex *mutex, QWaitCondition *cond);
+-
+-private:
+-    QEglFSKmsDevice *m_device = nullptr;
+-    QEglFSKmsEventReaderThread *m_thread = nullptr;
+-};
+-
+-QT_END_NAMESPACE
+-
+-#endif // QEGLFSKKMSEVENTREADER_H
+diff --git a/src/plugins/platforms/eglfs/deviceintegration/eglfs_kms_support/qeglfskmsscreen.cpp b/src/plugins/platforms/eglfs/deviceintegration/eglfs_kms_support/qeglfskmsscreen.cpp
+index 959f17eba3..b097f67e93 100644
+--- a/src/plugins/platforms/eglfs/deviceintegration/eglfs_kms_support/qeglfskmsscreen.cpp
++++ b/src/plugins/platforms/eglfs/deviceintegration/eglfs_kms_support/qeglfskmsscreen.cpp
+@@ -40,7 +40,6 @@
+ ****************************************************************************/
+ 
+ #include "qeglfskmsscreen.h"
+-#include "qeglfskmsdevice.h"
+ #include "qeglfsintegration_p.h"
+ 
+ #include <QtCore/QLoggingCategory>
+@@ -69,7 +68,7 @@ private:
+     QEglFSKmsScreen *m_screen;
+ };
+ 
+-QEglFSKmsScreen::QEglFSKmsScreen(QEglFSKmsDevice *device, const QKmsOutput &output, bool headless)
++QEglFSKmsScreen::QEglFSKmsScreen(QKmsDevice *device, const QKmsOutput &output, bool headless)
+     : QEglFSScreen(static_cast<QEglFSIntegration *>(QGuiApplicationPrivate::platformIntegration())->display())
+     , m_device(device)
+     , m_output(output)
+diff --git a/src/plugins/platforms/eglfs/deviceintegration/eglfs_kms_support/qeglfskmsscreen.h b/src/plugins/platforms/eglfs/deviceintegration/eglfs_kms_support/qeglfskmsscreen.h
+index a5c8f5b4e8..93d7e4c1eb 100644
+--- a/src/plugins/platforms/eglfs/deviceintegration/eglfs_kms_support/qeglfskmsscreen.h
++++ b/src/plugins/platforms/eglfs/deviceintegration/eglfs_kms_support/qeglfskmsscreen.h
+@@ -51,13 +51,12 @@
+ 
+ QT_BEGIN_NAMESPACE
+ 
+-class QEglFSKmsDevice;
+ class QEglFSKmsInterruptHandler;
+ 
+ class Q_EGLFS_EXPORT QEglFSKmsScreen : public QEglFSScreen
+ {
+ public:
+-    QEglFSKmsScreen(QEglFSKmsDevice *device, const QKmsOutput &output, bool headless = false);
++    QEglFSKmsScreen(QKmsDevice *device, const QKmsOutput &output, bool headless = false);
+     ~QEglFSKmsScreen();
+ 
+     void setVirtualPosition(const QPoint &pos);
+@@ -88,7 +87,7 @@ public:
+     int currentMode() const override;
+     int preferredMode() const override;
+ 
+-    QEglFSKmsDevice *device() const { return m_device; }
++    QKmsDevice *device() const { return m_device; }
+ 
+     virtual void waitForFlip();
+ 
+@@ -104,7 +103,7 @@ public:
+     void setCursorOutOfRange(bool b) { m_cursorOutOfRange = b; }
+ 
+ protected:
+-    QEglFSKmsDevice *m_device;
++    QKmsDevice *m_device;
+ 
+     QKmsOutput m_output;
+     QEdidParser m_edid;
+diff --git a/src/plugins/platforms/eglfs/deviceintegration/eglfs_kms_vsp2/qeglfskmsvsp2screen.cpp b/src/plugins/platforms/eglfs/deviceintegration/eglfs_kms_vsp2/qeglfskmsvsp2screen.cpp
+index c255bc84b7..475d9d55dd 100644
+--- a/src/plugins/platforms/eglfs/deviceintegration/eglfs_kms_vsp2/qeglfskmsvsp2screen.cpp
++++ b/src/plugins/platforms/eglfs/deviceintegration/eglfs_kms_vsp2/qeglfskmsvsp2screen.cpp
+@@ -99,7 +99,7 @@ QEglFSKmsVsp2Screen::DmaBuffer *QEglFSKmsVsp2Screen::dmaBufferForGbmBuffer(gbm_b
+     return fb.take();
+ }
+ 
+-QEglFSKmsVsp2Screen::QEglFSKmsVsp2Screen(QEglFSKmsDevice *device, const QKmsOutput &output)
++QEglFSKmsVsp2Screen::QEglFSKmsVsp2Screen(QKmsDevice *device, const QKmsOutput &output)
+     : QEglFSKmsScreen(device, output)
+     , m_blender(new Blender(this))
+ {
+diff --git a/src/plugins/platforms/eglfs/deviceintegration/eglfs_kms_vsp2/qeglfskmsvsp2screen.h b/src/plugins/platforms/eglfs/deviceintegration/eglfs_kms_vsp2/qeglfskmsvsp2screen.h
+index 378786643d..7618510333 100644
+--- a/src/plugins/platforms/eglfs/deviceintegration/eglfs_kms_vsp2/qeglfskmsvsp2screen.h
++++ b/src/plugins/platforms/eglfs/deviceintegration/eglfs_kms_vsp2/qeglfskmsvsp2screen.h
+@@ -53,7 +53,7 @@ QT_BEGIN_NAMESPACE
+ class QEglFSKmsVsp2Screen : public QEglFSKmsScreen
+ {
+ public:
+-    QEglFSKmsVsp2Screen(QEglFSKmsDevice *device, const QKmsOutput &output);
++    QEglFSKmsVsp2Screen(QKmsDevice *device, const QKmsOutput &output);
+ 
+     gbm_surface *createSurface();
+     void resetSurface();
+-- 
+2.25.1
+
