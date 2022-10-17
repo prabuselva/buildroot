@@ -15,4 +15,5 @@ PYTHON3_MAKO_LICENSE_FILES = LICENSE
 HOST_PYTHON3_MAKO_DL_SUBDIR = python-mako
 HOST_PYTHON3_MAKO_NEEDS_HOST_PYTHON = python3
 
+$(eval $(python-package))
 $(eval $(host-python-package))

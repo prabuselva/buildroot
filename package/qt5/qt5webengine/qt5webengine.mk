@@ -9,7 +9,7 @@ QT5WEBENGINE_SITE = $(QT5_SITE)
 QT5WEBENGINE_SOURCE = qtwebengine-$(QT5_SOURCE_TARBALL_PREFIX)-$(QT5WEBENGINE_VERSION).tar.xz
 QT5WEBENGINE_DEPENDENCIES = ffmpeg libglib2 libvpx libxkbcommon opus webp \
 	qt5declarative qt5webchannel host-bison host-flex host-gperf \
-	host-pkgconf host-python host-harfbuzz xlib_libXdamage host-webp
+	host-pkgconf host-python host-harfbuzz host-webp
 QT5WEBENGINE_INSTALL_STAGING = YES
 
 include package/qt5/qt5webengine/chromium-latest.inc
@@ -24,7 +24,7 @@ endif
 
 ifeq ($(BR2_PACKAGE_QT5BASE_XCB),y)
 QT5WEBENGINE_DEPENDENCIES += xlib_libXScrnSaver xlib_libXcomposite \
-	xlib_libXcursor xlib_libXi xlib_libXrandr xlib_libXtst
+	xlib_libXcursor xlib_libXi xlib_libXrandr xlib_libXtst xlib_libXdamage
 endif
 
 QT5WEBENGINE_DEPENDENCIES += host-libpng host-libnss libnss

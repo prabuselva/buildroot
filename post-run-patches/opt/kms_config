@@ -1,3 +1,7 @@
 {
-"hwcursor" : false
+"hwcursor" : false,
+"outputs": [{
+      "name": "HDMI1",
+      "mode": "720x400"
+ }]
 }
