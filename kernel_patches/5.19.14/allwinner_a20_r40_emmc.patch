@@ -1,0 +1,14 @@
+--- a/drivers/mmc/host/sunxi-mmc.c	2022-10-18 16:33:29.149253021 +0800
++++ b/drivers/mmc/host/sunxi-mmc.c	2022-10-17 18:20:44.280792228 +0800
+@@ -1437,8 +1437,9 @@
+ 	 * variants that support them.
+ 	 */
+ 	if ((host->cfg->clk_delays || host->use_new_timings) &&
+-	    !of_device_is_compatible(pdev->dev.of_node,
+-				     "allwinner,sun50i-h5-emmc"))
++	    !of_device_is_compatible(pdev->dev.of_node, "allwinner,sun50i-h5-emmc") &&
++	    !of_machine_is_compatible("allwinner,sun7i-a20") &&
++	    !of_machine_is_compatible("allwinner,sun8i-r40"))
+ 		mmc->caps      |= MMC_CAP_1_8V_DDR | MMC_CAP_3_3V_DDR;
+ 
+ 	ret = mmc_of_parse(mmc);
